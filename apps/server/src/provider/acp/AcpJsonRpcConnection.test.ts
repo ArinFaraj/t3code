@@ -508,6 +508,9 @@ describe("AcpSessionRuntime", () => {
       const error = yield* runtime.start().pipe(Effect.flip);
 
       expect(error._tag).toBe("AcpRequestError");
+      if (error._tag === "AcpRequestError") {
+        expect(error.errorMessage).toContain("Mock load session failure");
+      }
     }).pipe(
       Effect.provide(
         AcpSessionRuntime.layer({

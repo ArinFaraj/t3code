@@ -728,6 +728,8 @@ export const make = (
               error: loadError.success,
             });
             return yield* resumeAlreadyOpenError(loadError.success);
+          } else if (Result.isSuccess(loadError)) {
+            return yield* Effect.failCause(loadExit.cause);
           } else {
             const loadDefect = Exit.findDefect(loadExit);
             if (Result.isSuccess(loadDefect) && isSessionAlreadyOpenError(loadDefect.success)) {

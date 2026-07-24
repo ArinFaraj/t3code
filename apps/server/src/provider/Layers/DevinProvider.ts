@@ -101,7 +101,7 @@ function devinModelsFromSettings(
   return providerModelsFromSettings(builtInModels, customModels ?? [], EMPTY_CAPABILITIES);
 }
 
-function buildDevinDiscoveredModelsFromConfigOptions(
+export function buildDevinDiscoveredModelsFromConfigOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | null | undefined,
 ): ReadonlyArray<ServerProviderModel> {
   const modelOption = findSessionConfigOption(configOptions, "model");
@@ -111,9 +111,14 @@ function buildDevinDiscoveredModelsFromConfigOptions(
   const currentValue = modelOption.currentValue?.toString().trim();
   const seen = new Set<string>();
   return modelOption.options
-    .map((entry): ServerProviderModel | undefined => {
-      const value = "value" in entry ? entry.value : entry.options[0]?.value;
-      if (typeof value !== "string" || !value.trim()) {
+    .flatMap((entry) =>
+      "value" in entry
+        ? [{ value: entry.value, name: entry.name }]
+        : entry.options.map((option) => ({ value: option.value, name: option.name })),
+    )
+    .map((leaf): ServerProviderModel | undefined => {
+      const value = leaf.value.toString().trim();
+      if (!value) {
         return undefined;
       }
       const slug = resolveDevinAcpBaseModelId(value);
@@ -121,14 +126,11 @@ function buildDevinDiscoveredModelsFromConfigOptions(
         return undefined;
       }
       seen.add(slug);
-      const name =
-        ("value" in entry
-          ? entry.name.trim()
-          : entry.options[0]?.name.trim() || entry.name.trim()) || slug;
+      const name = leaf.name.trim() || slug;
       return {
         slug,
         name,
-        shortName: "value" in entry ? entry.name.trim() : entry.name.trim() || undefined,
+        shortName: leaf.name.trim() || undefined,
         isCustom: false,
         isDefault: currentValue === slug ? true : undefined,
         capabilities: EMPTY_CAPABILITIES,
