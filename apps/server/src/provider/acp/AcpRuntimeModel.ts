@@ -108,6 +108,31 @@ export type AcpParsedSessionEvent =
       readonly itemId?: string;
       readonly text: string;
       readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "ReasoningDelta";
+      readonly itemId?: string;
+      readonly text: string;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "ConfigOptionsUpdated";
+      readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "SessionInfoUpdated";
+      readonly title?: string | null;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "UsageUpdated";
+      readonly used?: number;
+      readonly size?: number;
+      readonly inputTokens?: number;
+      readonly outputTokens?: number;
+      readonly cachedReadTokens?: number;
+      readonly rawPayload: unknown;
     };
 
 type AcpSessionSetupResponse =
@@ -572,6 +597,55 @@ export function parseSessionUpdateEvent(params: EffectAcpSchema.SessionNotificat
           rawPayload: params,
         });
       }
+      break;
+    }
+    case "agent_thought_chunk": {
+      if (upd.content.type === "text" && upd.content.text.length > 0) {
+        events.push({
+          _tag: "ReasoningDelta",
+          text: upd.content.text,
+          rawPayload: params,
+        });
+      }
+      break;
+    }
+    case "config_option_update": {
+      if (upd.configOptions.length > 0) {
+        events.push({
+          _tag: "ConfigOptionsUpdated",
+          configOptions: upd.configOptions,
+          rawPayload: params,
+        });
+      }
+      break;
+    }
+    case "session_info_update": {
+      if (upd.title !== undefined && upd.title !== null && upd.title.trim().length > 0) {
+        events.push({
+          _tag: "SessionInfoUpdated",
+          title: upd.title,
+          rawPayload: params,
+        });
+      }
+      break;
+    }
+    case "usage_update": {
+      const meta = isRecord(upd._meta) ? upd._meta : {};
+      events.push({
+        _tag: "UsageUpdated",
+        ...(typeof upd.used === "number" ? { used: upd.used } : {}),
+        ...(typeof upd.size === "number" ? { size: upd.size } : {}),
+        ...(typeof meta["cognition.ai/inputTokens"] === "number"
+          ? { inputTokens: meta["cognition.ai/inputTokens"] }
+          : {}),
+        ...(typeof meta["cognition.ai/outputTokens"] === "number"
+          ? { outputTokens: meta["cognition.ai/outputTokens"] }
+          : {}),
+        ...(typeof meta["cognition.ai/cachedReadTokens"] === "number"
+          ? { cachedReadTokens: meta["cognition.ai/cachedReadTokens"] }
+          : {}),
+        rawPayload: params,
+      });
       break;
     }
     default:

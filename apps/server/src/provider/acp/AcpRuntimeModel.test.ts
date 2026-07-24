@@ -336,6 +336,139 @@ describe("AcpRuntimeModel", () => {
     ]);
   });
 
+  it("parses Devin ACP reasoning, usage, session info, and config option updates", () => {
+    const reasoningResult = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text: "thinking..." },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(reasoningResult.events).toEqual([
+      {
+        _tag: "ReasoningDelta",
+        text: "thinking...",
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "thinking..." },
+          },
+        },
+      },
+    ]);
+
+    const usageResult = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "usage_update",
+        used: 12300,
+        size: 262000,
+        _meta: {
+          "cognition.ai/inputTokens": 12273,
+          "cognition.ai/outputTokens": 29,
+          "cognition.ai/cachedReadTokens": 5120,
+        },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(usageResult.events).toEqual([
+      {
+        _tag: "UsageUpdated",
+        used: 12300,
+        size: 262000,
+        inputTokens: 12273,
+        outputTokens: 29,
+        cachedReadTokens: 5120,
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "usage_update",
+            used: 12300,
+            size: 262000,
+            _meta: {
+              "cognition.ai/inputTokens": 12273,
+              "cognition.ai/outputTokens": 29,
+              "cognition.ai/cachedReadTokens": 5120,
+            },
+          },
+        },
+      },
+    ]);
+
+    const infoResult = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "session_info_update",
+        title: "Say hi",
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(infoResult.events).toEqual([
+      {
+        _tag: "SessionInfoUpdated",
+        title: "Say hi",
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            title: "Say hi",
+          },
+        },
+      },
+    ]);
+
+    const configResult = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: "swe-1-7",
+            options: [{ value: "swe-1-7", name: "SWE-1.7 Max" }],
+          },
+        ],
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(configResult.events).toEqual([
+      {
+        _tag: "ConfigOptionsUpdated",
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: "swe-1-7",
+            options: [{ value: "swe-1-7", name: "SWE-1.7 Max" }],
+          },
+        ],
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: "swe-1-7",
+                options: [{ value: "swe-1-7", name: "SWE-1.7 Max" }],
+              },
+            ],
+          },
+        },
+      },
+    ]);
+  });
+
   it("keeps permission request parsing compatible with loose extension payloads", () => {
     const request = parsePermissionRequest({
       sessionId: "session-1",
