@@ -5,8 +5,10 @@ import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -38,6 +40,60 @@ import {
 
 function formatConfigOptionValue(value: string | boolean): string {
   return JSON.stringify(value);
+}
+
+function extractMessageFromUnknown(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.message;
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "message" in value &&
+    typeof (value as { message: unknown }).message === "string"
+  ) {
+    return (value as { message: string }).message;
+  }
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "errorMessage" in value &&
+    typeof (value as { errorMessage: unknown }).errorMessage === "string"
+  ) {
+    return (value as { errorMessage: string }).errorMessage;
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.values(value).map(extractMessageFromUnknown).join(" ");
+  }
+  return String(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function isSessionAlreadyOpenError(error: unknown): boolean {
+  if (!isRecord(error) || !("_tag" in error)) {
+    return extractMessageFromUnknown(error).includes("already open in another process");
+  }
+  if (error._tag === "AcpRequestError" && typeof error.errorMessage === "string") {
+    return error.errorMessage.includes("already open in another process");
+  }
+  if (error._tag === "AcpTransportError") {
+    const detail = typeof error.detail === "string" ? error.detail : "";
+    if (detail.includes("already open in another process")) return true;
+    if ("cause" in error && error.cause !== undefined) {
+      return isSessionAlreadyOpenError(error.cause);
+    }
+  }
+  return extractMessageFromUnknown(error).includes("already open in another process");
+}
+
+const RESUME_ALREADY_OPEN_DATA = { _tag: "AcpSessionResumeAlreadyOpen" } as const;
+
+export function isAcpSessionResumeAlreadyOpenError(error: unknown): boolean {
+  if (!isRecord(error) || error._tag !== "AcpRequestError") return false;
+  const data = error.data;
+  return isRecord(data) && data._tag === "AcpSessionResumeAlreadyOpen";
 }
 
 export interface AcpSessionEventStreamBarrier {
@@ -559,6 +615,19 @@ export const make = (
         );
       }
 
+      const createPayload = {
+        cwd: options.cwd,
+        mcpServers: options.mcpServers ?? [],
+      } satisfies EffectAcpSchema.NewSessionRequest;
+      const createNewSession = Effect.gen(function* () {
+        const created = yield* runLoggedRequest(
+          "session/new",
+          createPayload,
+          acp.agent.createSession(createPayload),
+        );
+        return created;
+      });
+
       let sessionId: string;
       let sessionSetupResult:
         | EffectAcpSchema.LoadSessionResponse
@@ -587,8 +656,7 @@ export const make = (
           }),
         );
 
-        sessionId = options.resumeSessionId;
-        sessionSetupResult = yield* Effect.gen(function* () {
+        const loadAttempt = Effect.gen(function* () {
           yield* logRequest({
             method: "session/load",
             payload: loadPayload,
@@ -638,16 +706,45 @@ export const make = (
 
           return loaded;
         }).pipe(Effect.ensuring(Ref.set(sessionLoadGateRef, Option.none())));
+
+        const resumeAlreadyOpenError = (originalError: unknown) =>
+          new EffectAcpErrors.AcpRequestError({
+            code: -32000,
+            errorMessage: extractMessageFromUnknown(originalError),
+            method: "session/load",
+            operation: "receive-response",
+            data: RESUME_ALREADY_OPEN_DATA,
+          });
+
+        const loadExit = yield* loadAttempt.pipe(Effect.exit);
+        if (Exit.isSuccess(loadExit)) {
+          sessionId = options.resumeSessionId;
+          sessionSetupResult = loadExit.value;
+        } else {
+          const loadError = Exit.findError(loadExit);
+          if (Result.isSuccess(loadError) && isSessionAlreadyOpenError(loadError.success)) {
+            yield* Effect.logWarning("acp.session.load.already-open", {
+              sessionId: options.resumeSessionId,
+              error: loadError.success,
+            });
+            return yield* resumeAlreadyOpenError(loadError.success);
+          } else {
+            const loadDefect = Exit.findDefect(loadExit);
+            if (Result.isSuccess(loadDefect) && isSessionAlreadyOpenError(loadDefect.success)) {
+              yield* Effect.logWarning("acp.session.load.already-open", {
+                sessionId: options.resumeSessionId,
+                error: loadDefect.success,
+              });
+              return yield* resumeAlreadyOpenError(loadDefect.success);
+            } else if (Result.isSuccess(loadDefect)) {
+              return yield* Effect.die(loadDefect.success);
+            } else {
+              return yield* Effect.interrupt;
+            }
+          }
+        }
       } else {
-        const createPayload = {
-          cwd: options.cwd,
-          mcpServers: options.mcpServers ?? [],
-        } satisfies EffectAcpSchema.NewSessionRequest;
-        const created = yield* runLoggedRequest(
-          "session/new",
-          createPayload,
-          acp.agent.createSession(createPayload),
-        );
+        const created = yield* createNewSession;
         sessionId = created.sessionId;
         sessionSetupResult = created;
       }

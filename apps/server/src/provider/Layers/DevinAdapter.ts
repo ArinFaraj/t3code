@@ -42,7 +42,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
-import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
+import * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
@@ -559,11 +559,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
-          const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
-          yield* Effect.addFinalizer(() =>
-            sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
-          );
 
           const resumeSessionId = parseDevinResume(input.resumeCursor)?.sessionId;
           const acpNativeLoggers = makeAcpNativeLoggers({
@@ -573,115 +569,149 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           });
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-          const acp = yield* makeDevinAcpRuntime({
-            devinSettings,
-            ...(options?.environment ? { environment: options.environment } : {}),
-            childProcessSpawner,
-            cwd,
-            ...(resumeSessionId ? { resumeSessionId } : {}),
-            clientInfo: { name: "t3-code", version: "0.0.0" },
-            ...(mcpSession
-              ? {
-                  mcpServers: [
-                    {
-                      type: "http" as const,
-                      name: "t3-code",
-                      url: mcpSession.endpoint,
-                      headers: [
-                        {
-                          name: "Authorization",
-                          value: mcpSession.authorizationHeader,
-                        },
-                      ],
-                    },
-                  ],
-                }
-              : {}),
-            ...acpNativeLoggers,
-          }).pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-            Effect.provideService(Scope.Scope, sessionScope),
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterProcessError({
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  detail: cause.message,
-                  cause,
+
+          const startAcpSession = (attemptResumeSessionId: string | undefined) =>
+            Effect.acquireUseRelease(
+              Scope.make("sequential"),
+              (sessionScope) =>
+                Effect.gen(function* () {
+                  const acp = yield* makeDevinAcpRuntime({
+                    devinSettings,
+                    ...(options?.environment ? { environment: options.environment } : {}),
+                    childProcessSpawner,
+                    cwd,
+                    ...(attemptResumeSessionId ? { resumeSessionId: attemptResumeSessionId } : {}),
+                    clientInfo: { name: "t3-code", version: "0.0.0" },
+                    ...(mcpSession
+                      ? {
+                          mcpServers: [
+                            {
+                              type: "http" as const,
+                              name: "t3-code",
+                              url: mcpSession.endpoint,
+                              headers: [
+                                {
+                                  name: "Authorization",
+                                  value: mcpSession.authorizationHeader,
+                                },
+                              ],
+                            },
+                          ],
+                        }
+                      : {}),
+                    ...acpNativeLoggers,
+                  }).pipe(
+                    Effect.provideService(Crypto.Crypto, crypto),
+                    Effect.provideService(Scope.Scope, sessionScope),
+                    Effect.mapError(
+                      (cause) =>
+                        new ProviderAdapterProcessError({
+                          provider: PROVIDER,
+                          threadId: input.threadId,
+                          detail: cause.message,
+                          cause,
+                        }),
+                    ),
+                  );
+                  const started = yield* Effect.gen(function* () {
+                    yield* acp.handleRequestPermission((params) =>
+                      mapAcpCallbackFailure(
+                        Effect.gen(function* () {
+                          yield* logNative(input.threadId, "session/request_permission", params);
+                          if (input.runtimeMode === "full-access") {
+                            const autoApprovedOptionId = selectAutoApprovedPermissionOption(params);
+                            if (autoApprovedOptionId !== undefined) {
+                              return {
+                                outcome: {
+                                  outcome: "selected" as const,
+                                  optionId: autoApprovedOptionId,
+                                },
+                              };
+                            }
+                          }
+                          const permissionRequest = parsePermissionRequest(params);
+                          const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+                          const runtimeRequestId = RuntimeRequestId.make(requestId);
+                          const decision = yield* Deferred.make<ProviderApprovalDecision>();
+                          const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                          pendingApprovals.set(requestId, { decision });
+                          yield* offerRuntimeEvent(
+                            makeAcpRequestOpenedEvent({
+                              stamp: yield* makeEventStamp(),
+                              provider: PROVIDER,
+                              threadId: input.threadId,
+                              turnId,
+                              requestId: runtimeRequestId,
+                              permissionRequest,
+                              detail:
+                                permissionRequest.detail ??
+                                encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
+                                "[unserializable params]",
+                              args: params,
+                              source: "acp.jsonrpc",
+                              method: "session/request_permission",
+                              rawPayload: params,
+                            }),
+                          );
+                          const resolved = yield* Deferred.await(decision);
+                          pendingApprovals.delete(requestId);
+                          yield* offerRuntimeEvent(
+                            makeAcpRequestResolvedEvent({
+                              stamp: yield* makeEventStamp(),
+                              provider: PROVIDER,
+                              threadId: input.threadId,
+                              turnId,
+                              requestId: runtimeRequestId,
+                              permissionRequest,
+                              decision: resolved,
+                            }),
+                          );
+                          const selectedOptionId =
+                            resolved === "cancel"
+                              ? undefined
+                              : selectPermissionOptionId(params, resolved);
+                          return {
+                            outcome: selectedOptionId
+                              ? {
+                                  outcome: "selected" as const,
+                                  optionId: selectedOptionId,
+                                }
+                              : ({ outcome: "cancelled" } as const),
+                          };
+                        }),
+                      ),
+                    );
+                    return yield* acp.start();
+                  });
+                  return { acp, started, sessionScope };
                 }),
+              (sessionScope, exit) =>
+                Exit.isFailure(exit) ? Scope.close(sessionScope, Exit.void) : Effect.void,
+            );
+
+          const { acp, started, sessionScope } = yield* startAcpSession(resumeSessionId).pipe(
+            Effect.catchTag("AcpRequestError", (error) => {
+              if (AcpSessionRuntime.isAcpSessionResumeAlreadyOpenError(error)) {
+                return Effect.gen(function* () {
+                  yield* Effect.logWarning("devin.session.resume.already-open", {
+                    threadId: input.threadId,
+                    sessionId: resumeSessionId,
+                    error,
+                  });
+                  return yield* startAcpSession(undefined);
+                });
+              }
+              return Effect.fail(error);
+            }),
+            Effect.mapError((error) =>
+              error._tag === "ProviderAdapterProcessError"
+                ? error
+                : mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
             ),
           );
-          const started = yield* Effect.gen(function* () {
-            yield* acp.handleRequestPermission((params) =>
-              mapAcpCallbackFailure(
-                Effect.gen(function* () {
-                  yield* logNative(input.threadId, "session/request_permission", params);
-                  if (input.runtimeMode === "full-access") {
-                    const autoApprovedOptionId = selectAutoApprovedPermissionOption(params);
-                    if (autoApprovedOptionId !== undefined) {
-                      return {
-                        outcome: {
-                          outcome: "selected" as const,
-                          optionId: autoApprovedOptionId,
-                        },
-                      };
-                    }
-                  }
-                  const permissionRequest = parsePermissionRequest(params);
-                  const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
-                  const runtimeRequestId = RuntimeRequestId.make(requestId);
-                  const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                  const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
-                  pendingApprovals.set(requestId, { decision });
-                  yield* offerRuntimeEvent(
-                    makeAcpRequestOpenedEvent({
-                      stamp: yield* makeEventStamp(),
-                      provider: PROVIDER,
-                      threadId: input.threadId,
-                      turnId,
-                      requestId: runtimeRequestId,
-                      permissionRequest,
-                      detail:
-                        permissionRequest.detail ??
-                        encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
-                        "[unserializable params]",
-                      args: params,
-                      source: "acp.jsonrpc",
-                      method: "session/request_permission",
-                      rawPayload: params,
-                    }),
-                  );
-                  const resolved = yield* Deferred.await(decision);
-                  pendingApprovals.delete(requestId);
-                  yield* offerRuntimeEvent(
-                    makeAcpRequestResolvedEvent({
-                      stamp: yield* makeEventStamp(),
-                      provider: PROVIDER,
-                      threadId: input.threadId,
-                      turnId,
-                      requestId: runtimeRequestId,
-                      permissionRequest,
-                      decision: resolved,
-                    }),
-                  );
-                  const selectedOptionId =
-                    resolved === "cancel" ? undefined : selectPermissionOptionId(params, resolved);
-                  return {
-                    outcome: selectedOptionId
-                      ? {
-                          outcome: "selected" as const,
-                          optionId: selectedOptionId,
-                        }
-                      : ({ outcome: "cancelled" } as const),
-                  };
-                }),
-              ),
-            );
-            return yield* acp.start();
-          }).pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
-            ),
+
+          yield* Effect.addFinalizer(() =>
+            sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
           );
 
           const startModelSelection =
